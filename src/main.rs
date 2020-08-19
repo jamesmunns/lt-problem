@@ -1,10 +1,11 @@
 use bbqueue::{
-    BBBuffer, ConstBBBuffer, consts, framed::FrameProducer, framed::FrameConsumer,
+    consts, framed::FrameConsumer, framed::FrameGrantR, framed::FrameProducer, BBBuffer,
+    ConstBBBuffer,
 };
-use serde::{Serialize, Deserialize, de::DeserializeOwned};
-use postcard::{to_slice, from_bytes};
+use postcard::{from_bytes, to_slice};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-static BB: BBBuffer<consts::U1024> = BBBuffer( ConstBBBuffer::new() );
+static BB: BBBuffer<consts::U1024> = BBBuffer(ConstBBBuffer::new());
 
 struct Txer {
     prod: FrameProducer<'static, consts::U1024>,
@@ -13,7 +14,7 @@ struct Txer {
 impl Txer {
     fn send<T>(&mut self, msg: &T) -> Result<(), ()>
     where
-        T: Serialize
+        T: Serialize,
     {
         let mut wgr = self.prod.grant(128).map_err(drop)?;
         let used = to_slice(msg, &mut wgr).map_err(drop)?.len();
@@ -26,10 +27,28 @@ struct Rxer {
     cons: FrameConsumer<'static, consts::U1024>,
 }
 
+struct Message<'a> {
+    fgr: FrameGrantR<'a, consts::U1024>,
+}
+
+impl<'a> Message<'a> {
+    fn view_with<'b: 'de, 'de, T, F, R>(&'b mut self, fun: F) -> Result<R, ()>
+    where
+        T: 'de + Deserialize<'de>,
+        F: FnOnce(T) -> R,
+        R: 'static,
+    {
+        match from_bytes(&self.fgr) {
+            Ok(msg) => Ok(fun(msg)),
+            Err(_e) => Err(()),
+        }
+    }
+}
+
 impl Rxer {
     fn rx_owned<T>(&mut self) -> Result<T, ()>
     where
-        T: DeserializeOwned
+        T: DeserializeOwned,
     {
         let rgr = self.cons.read().ok_or(())?;
         let result = from_bytes(&rgr);
@@ -37,20 +56,12 @@ impl Rxer {
         result.map_err(drop)
     }
 
-    fn rx_with<'de, T, F, R>(&mut self, fun: F) -> Result<R, ()>
-    where
-        T: 'de + Deserialize<'de>,
-        F: FnOnce(T) -> R,
-        R: 'static
-    {
-        let rgr = self.cons.read().ok_or(())?;
-        let result = match from_bytes(&rgr) {
-            Ok(msg) => Ok(fun(msg)),
-            Err(e) => Err(()),
-        };
-
-        rgr.release();
-        result
+    fn rx_view<'a, 'z: 'a>(&'z mut self) -> Result<Message<'a>, ()> {
+        // TODO: I need to add a version of bbqueue grants that `release(rgr.len())`
+        // the commit on drop, instead of `release(0)` on drop
+        Ok(Message {
+            fgr: self.cons.read().ok_or(())?,
+        })
     }
 }
 
@@ -80,17 +91,14 @@ fn main() {
 
     let to_borrow = &[5, 10, 15, 20, 25];
 
-    let tx = BorrowedData {
-        fuzz: to_borrow,
-    };
+    let tx = BorrowedData { fuzz: to_borrow };
     prod.send(&tx).unwrap();
-    let mut run = false;
-    let rx = cons.rx_with(|recv: BorrowedData| {
-        assert_eq!(recv, tx);
-        run = true;
-        true
-    }).unwrap();
+    let rx = cons.rx_view().and_then(|mut pkt| {
+        pkt.view_with(|msg: BorrowedData| {
+            assert_eq!(tx, msg);
+            true
+        })
+    });
 
-    assert!(rx);
-    assert!(run);
+    assert!(rx.unwrap());
 }
